@@ -478,6 +478,234 @@ std::string ROperator_ConvTranspose<T>::Generate(std::string OpName)
    return out.str();
 }
 
+template <typename T>
+std::string ROperator_ConvTranspose<T>::Generate_GPU_Kernel_ALPAKA(std::string opName) {
+   opName = "op_" + opName;
+   std::stringstream out;
+   out << "\n//---- ConvTranspose Col2im Kernel --- " << opName << "\n";
+   out << "struct Col2imKernel_" << opName << " {\n";
+   out << SP << "template<typename TAcc, typename T>\n";
+   out << SP << "ALPAKA_FN_ACC void operator()(\n";
+   out << SP << SP << "TAcc const& acc,\n";
+   out << SP << SP << "T const* data_col,\n";
+   out << SP << SP << "T* data_im,\n";
+   out << SP << SP << "int channels, int height, int width,\n";
+   out << SP << SP << "int kernel_h, int kernel_w,\n";
+   out << SP << SP << "int pad_h, int pad_w,\n";
+   out << SP << SP << "int stride_h, int stride_w,\n";
+   out << SP << SP << "int dilation_h, int dilation_w,\n";
+   out << SP << SP << "int input_h, int input_w,\n";
+   out << SP << SP << "std::size_t totalElements) const {\n\n";
+
+   out << SP << SP << "auto const global_thread_idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
+   out << SP << SP << "if (global_thread_idx >= totalElements) return;\n";
+   out << SP << SP << "auto const grid_thread_extent = alpaka::getWorkDiv<alpaka::Grid, alpaka::Threads>(acc)[0];\n\n";
+
+   out << SP << SP << "for (std::size_t i = global_thread_idx; i < totalElements; i += grid_thread_extent) {\n";
+   out << SP << SP << SP << "std::size_t remaining = i;\n";
+   out << SP << SP << SP << "int iw = remaining % input_w; remaining /= input_w;\n";
+   out << SP << SP << SP << "int ih = remaining % input_h; remaining /= input_h;\n";
+   out << SP << SP << SP << "int kw = remaining % kernel_w; remaining /= kernel_w;\n";
+   out << SP << SP << SP << "int kh = remaining % kernel_h; remaining /= kernel_h;\n";
+   out << SP << SP << SP << "int c = remaining % channels;\n\n";
+
+   out << SP << SP << SP << "int output_row = -pad_h + kh * dilation_h + ih * stride_h;\n";
+   out << SP << SP << SP << "int output_col = -pad_w + kw * dilation_w + iw * stride_w;\n\n";
+
+   out << SP << SP << SP << "if (output_row >= 0 && output_row < height && output_col >= 0 && output_col < width) {\n";
+   out << SP << SP << SP << SP << "alpaka::atomicAdd(acc, &data_im[c * height * width + output_row * width + output_col], data_col[i]);\n";
+   out << SP << SP << SP << "}\n";
+   out << SP << SP << "}\n";
+   out << SP << "}\n";
+   out << "};\n\n";
+
+   // Vectorization kernel for weights
+   out << "//---- ConvTranspose Weight Vectorization Kernel --- " << opName << "\n";
+   out << "struct WeightVecKernel_" << opName << " {\n";
+   out << SP << "template<typename TAcc, typename T>\n";
+   out << SP << "ALPAKA_FN_ACC void operator()(\n";
+   out << SP << SP << "TAcc const& acc,\n";
+   out << SP << SP << "T const* W,\n";
+   out << SP << SP << "T* W_f,\n";
+   out << SP << SP << "int ic_dim, int oc_dim,\n";
+   out << SP << SP << "int kh_dim, int kw_dim,\n";
+   out << SP << SP << "int kh_dil, int kw_dil,\n";
+   out << SP << SP << "int kh_stride, int kw_stride,\n";
+   out << SP << SP << "std::size_t totalElements) const {\n\n";
+
+   out << SP << SP << "auto const global_thread_idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
+   out << SP << SP << "if (global_thread_idx >= totalElements) return;\n";
+   out << SP << SP << "auto const grid_thread_extent = alpaka::getWorkDiv<alpaka::Grid, alpaka::Threads>(acc)[0];\n\n";
+
+   out << SP << SP << "for (std::size_t i = global_thread_idx; i < totalElements; i += grid_thread_extent) {\n";
+   out << SP << SP << SP << "std::size_t remaining = i;\n";
+   out << SP << SP << SP << "int kw = remaining % kw_dim; remaining /= kw_dim;\n";
+   out << SP << SP << SP << "int kh = remaining % kh_dim; remaining /= kh_dim;\n";
+   out << SP << SP << SP << "int oc = remaining % oc_dim; remaining /= oc_dim;\n";
+   out << SP << SP << SP << "int ic = remaining % ic_dim;\n\n";
+
+   out << SP << SP << SP << "std::size_t target_idx = ic * (oc_dim * kh_dil * kw_dil) + oc * (kh_dil * kw_dil) + kh * kh_stride + kw * kw_stride;\n";
+   out << SP << SP << SP << "W_f[target_idx] = W[i];\n";
+   out << SP << SP << "}\n";
+   out << SP << "}\n";
+   out << "};\n\n";
+
+   if (!fNB.empty()) {
+      out << "//---- ConvTranspose BiasAdd Kernel --- " << opName << "\n";
+      out << "struct BiasAddKernel_" << opName << " {\n";
+      out << SP << "template<typename TAcc, typename T>\n";
+      out << SP << "ALPAKA_FN_ACC void operator()(\n";
+      out << SP << SP << "TAcc const& acc,\n";
+      out << SP << SP << "T* output,\n";
+      out << SP << SP << "T const* bias,\n";
+      out << SP << SP << "std::size_t totalElements) const {\n\n";
+
+      out << SP << SP << "auto const global_thread_idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
+      out << SP << SP << "if (global_thread_idx >= totalElements) return;\n";
+      out << SP << SP << "auto const grid_thread_extent = alpaka::getWorkDiv<alpaka::Grid, alpaka::Threads>(acc)[0];\n\n";
+
+      out << SP << SP << "for (std::size_t i = global_thread_idx; i < totalElements; i += grid_thread_extent) {\n";
+      out << SP << SP << SP << "output[i] += bias[i];\n";
+      out << SP << SP << "}\n";
+      out << SP << "}\n";
+      out << "};\n";
+   }
+
+   return out.str();
+}
+
+template <typename T>
+std::string ROperator_ConvTranspose<T>::Generate_GPU_Kernel_Definitions_ALPAKA(std::string opName) {
+   opName = "op_" + opName;
+   std::string out = SP + "Col2imKernel_" + opName + " col2imKernel_" + opName + ";\n";
+   out += SP + "WeightVecKernel_" + opName + " weightVecKernel_" + opName + ";\n";
+   if (!fNB.empty()) {
+      out += SP + "BiasAddKernel_" + opName + " biasAddKernel_" + opName + ";\n";
+   }
+   return out;
+}
+
+template <typename T>
+std::string ROperator_ConvTranspose<T>::Generate_GPU_ALPAKA(std::string opName) {
+   opName = "op_" + opName;
+   if (fShapeY.empty()) {
+      throw std::runtime_error("TMVA SOFIE ConvTranspose Op called to Generate without being initialized first");
+   }
+
+   std::stringstream out;
+   out << "\n//--------- ConvTranspose_GPU_ALPAKA --- " << opName << "\n";
+
+   int channels_in = fShapeX[1];
+   int channels_out = fShapeY[1];
+   
+   int height_in = (fDim > 1) ? fShapeX[2] : 1;
+   int width_in = (fDim > 1) ? ((fDim > 2) ? fShapeX[4] : fShapeX[3]) : fShapeX[2];
+   
+   int height_out = (fDim > 1) ? fShapeY[2] : 1;
+   int width_out = (fDim > 1) ? ((fDim > 2) ? fShapeY[4] : fShapeY[3]) : fShapeY[2];
+
+   int kernel_h = (fDim > 1) ? fShapeW[2] : 1; // For 2D it's fShapeW[2], for 1D it's 1
+   int kernel_w = (fDim > 1) ? ((fDim > 2) ? fShapeW[4] : fShapeW[3]) : fShapeW[2]; 
+   if (fDim == 1) kernel_w = fShapeW[2];
+
+   int pad_h = fAttrPads[0];
+   int pad_w = (fDim > 1) ? fAttrPads[1] : 0;
+   
+   int stride_h = fAttrStrides[0];
+   int stride_w = (fDim > 1) ? fAttrStrides[1] : 1;
+   
+   int dilation_h = fAttrDilations[0];
+   int dilation_w = (fDim > 1) ? fAttrDilations[1] : 1;
+
+   size_t kernelSizeDil = 1;
+   for (size_t i = 0; i < fDim; i++) kernelSizeDil *= fAttrKernelShape[i];
+
+   size_t total_w = ConvertShapeToLength(fShapeW);
+   size_t total_xcol = (size_t)channels_out * kernelSizeDil * height_in * width_in;
+   size_t total_y = ConvertShapeToLength(fShapeY);
+
+   // 1. Weight Vectorization
+   out << SP << "{\n";
+   out << SP << SP << "auto const elementsPerThread = Vec::all(static_cast<Idx>(1));\n";
+   out << SP << SP << "auto const elementsPerGrid = Vec::all(Idx{" << total_w << "});\n";
+   out << SP << SP << "alpaka::KernelCfg<Acc> const kernelCfg = {elementsPerGrid, elementsPerThread};\n";
+   
+   int kh_dil = fAttrKernelShape[0];
+   int kw_dil = (fDim > 1) ? fAttrKernelShape[1] : 1;
+   int kh_stride = (fDim > 1) ? kw_dil * dilation_h : dilation_h;
+   int kw_stride = dilation_w;
+   
+   out << SP << SP << "auto const workDiv = alpaka::getValidWorkDiv(kernelCfg, devAcc, weightVecKernel_" << opName << ",\n";
+   out << SP << SP << SP << SP << "alpaka::getPtrNative(deviceBuf_" << fNW << "),\n";
+   out << SP << SP << SP << SP << "alpaka::getPtrNative(deviceBuf_" << fNX << "_f),\n";
+   out << SP << SP << SP << SP << channels_in << ", " << (int)fShapeW[1] << ",\n";
+   out << SP << SP << SP << SP << kernel_h << ", " << kernel_w << ",\n";
+   out << SP << SP << SP << SP << kh_dil << ", " << kw_dil << ",\n";
+   out << SP << SP << SP << SP << kh_stride << ", " << kw_stride << ", static_cast<Idx>(" << total_w << "));\n";
+   
+   out << SP << SP << "alpaka::exec<Acc>(queue, workDiv, weightVecKernel_" << opName << ",\n";
+   out << SP << SP << SP << SP << "alpaka::getPtrNative(deviceBuf_" << fNW << "),\n";
+   out << SP << SP << SP << SP << "alpaka::getPtrNative(deviceBuf_" << fNX << "_f),\n";
+   out << SP << SP << SP << SP << channels_in << ", " << (int)fShapeW[1] << ",\n";
+   out << SP << SP << SP << SP << kernel_h << ", " << kernel_w << ",\n";
+   out << SP << SP << SP << SP << kh_dil << ", " << kw_dil << ",\n";
+   out << SP << SP << SP << SP << kh_stride << ", " << kw_stride << ", static_cast<Idx>(" << total_w << "));\n";
+   out << SP << "}\n";
+
+   // 2. GEMM
+   // Resulting xcol matrix is (channels_out * kernelSizeDil, height_in * width_in)
+   int m_gemm = height_in * width_in;
+   int n_gemm = channels_out * kernelSizeDil;
+   int k_gemm = channels_in;
+
+   out << SP << "blas.gemm(\'n\', \'t\', " << m_gemm << ", " << n_gemm << ", " << k_gemm << ", 1.0f, " 
+       << "deviceBuf_" << fNX << ", " << "deviceBuf_" << fNX << "_f, 0.0f, " 
+       << "deviceBuf_" << fNX << "_xcol, deviceBuf_" << fNX << "_xcol);\n";
+
+   // 3. Col2im
+   out << SP << "{\n";
+   out << SP << SP << "alpaka::memset(queue, deviceBuf_" << fNY << ", 0x0);\n";
+   out << SP << SP << "auto const elementsPerThread = Vec::all(static_cast<Idx>(1));\n";
+   out << SP << SP << "auto const elementsPerGrid = Vec::all(Idx{" << total_xcol << "});\n";
+   out << SP << SP << "alpaka::KernelCfg<Acc> const kernelCfg = {elementsPerGrid, elementsPerThread};\n";
+   out << SP << SP << "auto const workDiv = alpaka::getValidWorkDiv(kernelCfg, devAcc, col2imKernel_" << opName << ",\n";
+   out << SP << SP << SP << SP << "alpaka::getPtrNative(deviceBuf_" << fNX << "_xcol" << "),\n";
+   out << SP << SP << SP << SP << "alpaka::getPtrNative(deviceBuf_" << fNY << "),\n";
+   out << SP << SP << SP << SP << channels_out << ", " << height_out << ", " << width_out << ",\n";
+   out << SP << SP << SP << SP << kh_dil << ", " << kw_dil << ",\n";
+   out << SP << SP << SP << SP << pad_h << ", " << pad_w << ", " << stride_h << ", " << stride_w << ", " << dilation_h << ", " << dilation_w << ",\n";
+   out << SP << SP << SP << SP << height_in << ", " << width_in << ", static_cast<Idx>(" << total_xcol << "));\n";
+   
+   out << SP << SP << "alpaka::exec<Acc>(queue, workDiv, col2imKernel_" << opName << ",\n";
+   out << SP << SP << SP << SP << "alpaka::getPtrNative(deviceBuf_" << fNX << "_xcol" << "),\n";
+   out << SP << SP << SP << SP << "alpaka::getPtrNative(deviceBuf_" << fNY << "),\n";
+   out << SP << SP << SP << SP << channels_out << ", " << height_out << ", " << width_out << ",\n";
+   out << SP << SP << SP << SP << kh_dil << ", " << kw_dil << ",\n";
+   out << SP << SP << SP << SP << pad_h << ", " << pad_w << ", " << stride_h << ", " << stride_w << ", " << dilation_h << ", " << dilation_w << ",\n";
+   out << SP << SP << SP << SP << height_in << ", " << width_in << ", static_cast<Idx>(" << total_xcol << "));\n";
+   out << SP << "}\n";
+
+   // 4. Bias addition
+   if (!fNB.empty()) {
+      out << SP << "{\n";
+      out << SP << SP << "auto const elementsPerThread = Vec::all(static_cast<Idx>(1));\n";
+      out << SP << SP << "auto const elementsPerGrid = Vec::all(Idx{" << total_y << "});\n";
+      out << SP << SP << "alpaka::KernelCfg<Acc> const kernelCfg = {elementsPerGrid, elementsPerThread};\n";
+      out << SP << SP << "auto const workDiv = alpaka::getValidWorkDiv(kernelCfg, devAcc, biasAddKernel_" << opName << ",\n";
+      out << SP << SP << SP << SP << "alpaka::getPtrNative(deviceBuf_" << fNY << "),\n";
+      out << SP << SP << SP << SP << "alpaka::getPtrNative(deviceBuf_" << fNBroadcastedB << "),\n";
+      out << SP << SP << SP << SP << "static_cast<Idx>(" << total_y << "));\n";
+      
+      out << SP << SP << "alpaka::exec<Acc>(queue, workDiv, biasAddKernel_" << opName << ",\n";
+      out << SP << SP << SP << SP << "alpaka::getPtrNative(deviceBuf_" << fNY << "),\n";
+      out << SP << SP << SP << SP << "alpaka::getPtrNative(deviceBuf_" << fNBroadcastedB << "),\n";
+      out << SP << SP << SP << SP << "static_cast<Idx>(" << total_y << "));\n";
+      out << SP << "}\n";
+   }
+
+   return out.str();
+}
+
 } // namespace SOFIE
 
 #endif
